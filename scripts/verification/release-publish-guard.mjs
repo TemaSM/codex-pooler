@@ -41,6 +41,14 @@ export function releasePublication(tag, sha, status, releases, registry = {}) {
   const release = releases.find((item) => item.tag_name === tag);
   if (!release || release.draft) throw new Error("a published release must exist before image publication");
   if (release.prerelease !== selected.prerelease) throw new Error("release prerelease flag disagrees with its version");
+  const immutable = registry?.versionTag;
+  if (immutable?.state === "present") {
+    if (immutable.version !== selected.version || immutable.revision !== sha)
+      throw new Error("immutable version tag points to a different release revision");
+    return { version: selected.version, tags: [], aliasStatus: {}, alreadyPublished: true };
+  }
+  if (immutable?.state !== "missing")
+    throw new Error("immutable version tag registry evidence is unavailable");
   const stable = releases
     .filter((item) => !item.draft && !item.prerelease)
     .flatMap((item) => {
@@ -77,7 +85,7 @@ export function releasePublication(tag, sha, status, releases, registry = {}) {
       if (!ahead) tags.push(alias);
     }
   }
-  return { version: selected.version, tags, aliasStatus };
+  return { version: selected.version, tags, aliasStatus, alreadyPublished: false };
 }
 
 const manifestTypes = [
@@ -94,7 +102,6 @@ const digestPattern = /^sha256:[a-f0-9]{64}$/;
 // is never evidence that a tag is absent; only MANIFEST_UNKNOWN at HTTP404 is.
 export async function registryEvidence(tag, options = {}) {
   const selected = parseTag(tag);
-  if (selected.prerelease) return {};
   const base = options.baseURL ?? "https://ghcr.io";
   const repository = options.repository ?? "icoretech/codex-pooler";
   const timeoutMs = options.timeoutMs ?? 15_000;
@@ -156,12 +163,13 @@ export async function registryEvidence(tag, options = {}) {
       headers.authorization = `Bearer ${token}`;
     } catch {
       return {
+        versionTag: { state: "unavailable", reason: "registry_auth_failed" },
         latest: { state: "unavailable", reason: "registry_auth_failed" },
         minor: { state: "unavailable", reason: "registry_auth_failed" },
       };
     }
   }
-  const readAlias = async (alias) => {
+  const readAlias = async (alias, requireRevision = false) => {
     const root = await jsonRequest(`/v2/${repository}/manifests/${alias}`);
     if (
       root.status === 404 &&
@@ -190,30 +198,45 @@ export async function registryEvidence(tag, options = {}) {
       }
     } else return { state: "unavailable", reason: "invalid_manifest" };
     const versions = [];
+    const revisions = [];
     for (const manifest of manifests) {
       if (!digestPattern.test(manifest.config?.digest))
         return { state: "unavailable", reason: "invalid_config_descriptor" };
       const config = await jsonRequest(`/v2/${repository}/blobs/${manifest.config.digest}`, true);
       if (config.error || config.status !== 200) return { state: "unavailable", reason: "image_config_unavailable" };
       try {
-        const version = parseTag(config.body?.config?.Labels?.["org.opencontainers.image.version"]);
-        if (version.prerelease) throw new Error("prerelease alias");
+        const labels = config.body?.config?.Labels;
+        const version = parseTag(labels?.["org.opencontainers.image.version"]);
+        if (version.prerelease && !requireRevision) throw new Error("prerelease alias");
         versions.push(version.version);
+        if (requireRevision) {
+          const revision = labels?.["org.opencontainers.image.revision"];
+          if (!/^[a-f0-9]{40}$/.test(revision ?? "")) throw new Error("invalid image revision");
+          revisions.push(revision);
+        }
       } catch {
-        return { state: "unavailable", reason: "invalid_image_version" };
+        return { state: "unavailable", reason: requireRevision ? "invalid_image_identity" : "invalid_image_version" };
       }
     }
     if (new Set(versions).size !== 1) return { state: "unavailable", reason: "platform_version_disagreement" };
-    return { state: "present", version: versions[0] };
+    if (requireRevision && new Set(revisions).size !== 1)
+      return { state: "unavailable", reason: "platform_revision_disagreement" };
+    return {
+      state: "present",
+      version: versions[0],
+      ...(requireRevision ? { revision: revisions[0] } : {}),
+    };
   };
-  const safeAlias = async (alias) => {
+  const safeAlias = async (alias, requireRevision = false) => {
     try {
-      return await readAlias(alias);
+      return await readAlias(alias, requireRevision);
     } catch {
       return { state: "unavailable", reason: "malformed_registry_evidence" };
     }
   };
-  return { latest: await safeAlias("latest"), minor: await safeAlias(selected.minor) };
+  const versionTag = await safeAlias(selected.version, true);
+  if (selected.prerelease) return { versionTag };
+  return { versionTag, latest: await safeAlias("latest"), minor: await safeAlias(selected.minor) };
 }
 
 async function main(args) {
@@ -251,7 +274,10 @@ async function main(args) {
   }
   if (output) {
     const dockerTags = result.tags.map((value) => `type=raw,value=${value}`).join("\n");
-    await appendFile(output, `version=${result.version}\ndocker_tags<<RELEASE_TAGS\n${dockerTags}\nRELEASE_TAGS\n`);
+    await appendFile(
+      output,
+      `version=${result.version}\nalready_published=${result.alreadyPublished}\ndocker_tags<<RELEASE_TAGS\n${dockerTags}\nRELEASE_TAGS\n`,
+    );
   }
   console.log(JSON.stringify(result));
 }

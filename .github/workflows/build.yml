@@ -4,6 +4,7 @@ on:
   push:
     tags:
       - '*'
+  status:
   workflow_dispatch:
     inputs:
       tag:
@@ -15,96 +16,124 @@ permissions:
   contents: write
   packages: write
 
-concurrency:
-  group: release-image-publication
-  cancel-in-progress: false
-
 jobs:
   build:
+    if: github.event_name != 'status' || (github.event.context == 'continuous-integration/drone/push' && github.event.state == 'success')
     runs-on: ubuntu-latest
+    concurrency:
+      group: release-image-publication
+      cancel-in-progress: false
 
     steps:
-      - name: Prepare release metadata
-        id: prepare
+      - name: Checkout publication coordinator
+        uses: actions/checkout@v7
+        with:
+          ref: main
+          fetch-depth: 0
+
+      - name: Select publication candidate
+        id: trigger
         env:
-          INPUT_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
+          GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
 
-          tag="${INPUT_TAG#refs/tags/}"
+          gh api --paginate --slurp "repos/${GITHUB_REPOSITORY}/releases?per_page=100" > "${RUNNER_TEMP}/release-list.json"
+          node scripts/verification/release-publish-trigger.mjs \
+            "$GITHUB_EVENT_NAME" "$GITHUB_EVENT_PATH" "${RUNNER_TEMP}/release-list.json" "$GITHUB_OUTPUT"
 
-          if [[ ! "$tag" =~ ^(codex-pooler-)?v?(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-[0-9A-Za-z.-]+)?$ ]]; then
-            echo "Provide a complete release version tag."
-            exit 1
-          fi
+      - name: Record deferred publication
+        if: steps.trigger.outputs.publish != 'true'
+        env:
+          REASON: ${{ steps.trigger.outputs.reason }}
+        run: |
+          echo "Image publication deferred: ${REASON}"
 
-          version="${tag#codex-pooler-}"
-          version="${version#v}"
-
-          {
-            echo "release_tag=$tag"
-            echo "checkout_ref=refs/tags/$tag"
-            echo "version=$version"
-          } >>"$GITHUB_OUTPUT"
-
-      - name: Checkout
+      - name: Checkout release revision
+        if: steps.trigger.outputs.publish == 'true'
         uses: actions/checkout@v7
         with:
-          ref: ${{ steps.prepare.outputs.checkout_ref }}
+          ref: refs/tags/${{ steps.trigger.outputs.release_tag }}
 
-      - name: Resolve checked-out revision
+      - name: Verify checked-out revision
+        if: steps.trigger.outputs.publish == 'true'
         id: revision
-        run: echo "sha=$(git rev-parse HEAD)" >>"$GITHUB_OUTPUT"
+        env:
+          EXPECTED_REVISION: ${{ steps.trigger.outputs.revision }}
+        run: |
+          set -euo pipefail
+
+          revision=$(git rev-parse HEAD)
+          if [[ "$revision" != "$EXPECTED_REVISION" ]]; then
+            echo "Release tag resolved to an unexpected revision."
+            exit 1
+          fi
+          echo "sha=$revision" >>"$GITHUB_OUTPUT"
 
       - name: Checkout publication policy
+        if: steps.trigger.outputs.publish == 'true'
         uses: actions/checkout@v7
         with:
           ref: main
           path: .release-policy
           sparse-checkout: |
             scripts/verification/release-publish-guard.mjs
+            scripts/verification/release-publish-trigger.mjs
             test/scripts/release_publish_guard_test.mjs
+            test/scripts/release_publish_trigger_test.mjs
             test/scripts/support/registry_fetch_route.mjs
           sparse-checkout-cone-mode: false
 
       - name: Verify publication policy
-        run: node --test .release-policy/test/scripts/release_publish_guard_test.mjs
+        if: steps.trigger.outputs.publish == 'true'
+        run: |
+          node --test \
+            .release-policy/test/scripts/release_publish_guard_test.mjs \
+            .release-policy/test/scripts/release_publish_trigger_test.mjs
 
       - name: Require verified revision and select monotonic release aliases
+        if: steps.trigger.outputs.publish == 'true'
         id: publication
         env:
           GH_TOKEN: ${{ github.token }}
-          RELEASE_TAG: ${{ steps.prepare.outputs.release_tag }}
+          RELEASE_TAG: ${{ steps.trigger.outputs.release_tag }}
           REVISION: ${{ steps.revision.outputs.sha }}
         run: |
           set -euo pipefail
-          deadline=$((SECONDS + 900))
-          while true; do
-            gh api "repos/${GITHUB_REPOSITORY}/commits/${REVISION}/status" > "${RUNNER_TEMP}/release-status.json"
-            ci_state=$(jq -r '[.statuses[] | select(.context == "continuous-integration/drone/push")][0].state // "pending"' "${RUNNER_TEMP}/release-status.json")
-            case "$ci_state" in
-              success) break ;;
-              pending) ;;
-              *) echo "Required revision check failed: $ci_state"; exit 1 ;;
-            esac
-            if (( SECONDS >= deadline )); then
-              echo "Timed out waiting for the required revision check"
-              exit 1
-            fi
-            sleep 15
-          done
+
+          gh api "repos/${GITHUB_REPOSITORY}/commits/${REVISION}/status" > "${RUNNER_TEMP}/release-status.json"
+          ci_state=$(jq -r '[.statuses[] | select(.context == "continuous-integration/drone/push")][0].state // "missing"' "${RUNNER_TEMP}/release-status.json")
+          if [[ "$ci_state" != "success" ]]; then
+            {
+              echo "ready=false"
+              echo "reason=drone_${ci_state}"
+            } >>"$GITHUB_OUTPUT"
+            echo "Image publication deferred: Drone state is ${ci_state}."
+            exit 0
+          fi
+
           gh api --paginate --slurp "repos/${GITHUB_REPOSITORY}/releases?per_page=100" > "${RUNNER_TEMP}/release-list.json"
-          node .release-policy/scripts/verification/release-publish-guard.mjs --registry "$RELEASE_TAG" "${RUNNER_TEMP}/registry-aliases.json"
           node .release-policy/scripts/verification/release-publish-guard.mjs \
-            "$RELEASE_TAG" "$REVISION" "${RUNNER_TEMP}/release-status.json" "${RUNNER_TEMP}/release-list.json" "${RUNNER_TEMP}/registry-aliases.json" "$GITHUB_OUTPUT"
+            --registry "$RELEASE_TAG" "${RUNNER_TEMP}/registry-aliases.json"
+          node .release-policy/scripts/verification/release-publish-guard.mjs \
+            "$RELEASE_TAG" "$REVISION" "${RUNNER_TEMP}/release-status.json" \
+            "${RUNNER_TEMP}/release-list.json" "${RUNNER_TEMP}/registry-aliases.json" "$GITHUB_OUTPUT"
+          echo "ready=true" >>"$GITHUB_OUTPUT"
+
+      - name: Record already published image
+        if: steps.publication.outputs.ready == 'true' && steps.publication.outputs.already_published == 'true'
+        run: echo "The immutable version tag already points to this release revision."
 
       - name: Set up QEMU
+        if: steps.publication.outputs.ready == 'true' && steps.publication.outputs.already_published != 'true'
         uses: docker/setup-qemu-action@v4
 
       - name: Set up Docker Buildx
+        if: steps.publication.outputs.ready == 'true' && steps.publication.outputs.already_published != 'true'
         uses: docker/setup-buildx-action@v4
 
       - name: Extract metadata for Docker
+        if: steps.publication.outputs.ready == 'true' && steps.publication.outputs.already_published != 'true'
         id: meta
         uses: docker/metadata-action@v6
         with:
@@ -117,10 +146,11 @@ jobs:
             org.opencontainers.image.documentation=https://github.com/icoretech/codex-pooler/blob/main/README.md
             org.opencontainers.image.vendor=iCoreTech, Inc.
             org.opencontainers.image.revision=${{ steps.revision.outputs.sha }}
-            org.opencontainers.image.version=${{ steps.prepare.outputs.version }}
+            org.opencontainers.image.version=${{ steps.publication.outputs.version }}
           tags: ${{ steps.publication.outputs.docker_tags }}
 
       - name: Login to GitHub Container Registry
+        if: steps.publication.outputs.ready == 'true' && steps.publication.outputs.already_published != 'true'
         uses: docker/login-action@v4
         with:
           registry: ghcr.io
@@ -128,6 +158,7 @@ jobs:
           password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Build and push Docker image
+        if: steps.publication.outputs.ready == 'true' && steps.publication.outputs.already_published != 'true'
         id: build
         uses: docker/build-push-action@v7
         with:
@@ -142,9 +173,10 @@ jobs:
           provenance: false
 
       - name: Prepare release assets
+        if: steps.publication.outputs.ready == 'true' && steps.publication.outputs.already_published != 'true'
         env:
-          RELEASE_TAG: ${{ steps.prepare.outputs.release_tag }}
-          VERSION: ${{ steps.prepare.outputs.version }}
+          RELEASE_TAG: ${{ steps.trigger.outputs.release_tag }}
+          VERSION: ${{ steps.publication.outputs.version }}
           IMAGE_DIGEST: ${{ steps.build.outputs.digest }}
           IMAGE_TAGS: ${{ steps.meta.outputs.tags }}
         run: |
@@ -174,9 +206,10 @@ jobs:
           } > "${digest_file}"
 
       - name: Upload release assets
+        if: steps.publication.outputs.ready == 'true' && steps.publication.outputs.already_published != 'true'
         env:
           GH_TOKEN: ${{ github.token }}
-          RELEASE_TAG: ${{ steps.prepare.outputs.release_tag }}
+          RELEASE_TAG: ${{ steps.trigger.outputs.release_tag }}
         run: |
           set -euo pipefail
 

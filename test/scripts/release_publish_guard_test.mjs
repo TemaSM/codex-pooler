@@ -18,6 +18,7 @@ const success = {
 	],
 };
 const absentAliases = {
+	versionTag: { state: "missing" },
 	latest: { state: "missing" },
 	minor: { state: "missing" },
 };
@@ -148,6 +149,7 @@ test("CLI writes reviewed tags and refuses failed evidence without modifying its
 
 test("registry aliases cannot regress when a newer release is removed from the inventory", () => {
 	const registry = {
+		versionTag: { state: "missing" },
 		latest: { state: "present", version: "1.4.9" },
 		minor: { state: "present", version: "1.4.8" },
 	};
@@ -160,12 +162,13 @@ test("registry aliases cannot regress when a newer release is removed from the i
 
 test("unknown or malformed registry evidence withholds aliases but keeps the verified version", () => {
 	for (const registry of [
-		{},
 		{
+			versionTag: { state: "missing" },
 			latest: { state: "unavailable", reason: "registry_read_failed" },
 			minor: { state: "unavailable" },
 		},
 		{
+			versionTag: { state: "missing" },
 			latest: { state: "present", version: "invalid" },
 			minor: { state: "present", version: "2.0.0" },
 		},
@@ -180,6 +183,35 @@ test("unknown or malformed registry evidence withholds aliases but keeps the ver
 		assert.deepEqual(result.tags, ["1.2.3"]);
 		assert.equal(result.aliasStatus.latest, "registry_evidence_unavailable");
 		assert.equal(result.aliasStatus["1.2"], "registry_evidence_unavailable");
+	}
+});
+
+test("an existing immutable version with the same revision is an idempotent success", () => {
+	const result = releasePublication("v1.2.3", sha, success, [release("v1.2.3")], {
+		versionTag: { state: "present", version: "1.2.3", revision: sha },
+		latest: { state: "present", version: "1.2.3" },
+		minor: { state: "present", version: "1.2.3" },
+	});
+	assert.equal(result.alreadyPublished, true);
+	assert.deepEqual(result.tags, []);
+});
+
+test("an immutable version with conflicting or unavailable identity fails closed", () => {
+	for (const versionTag of [
+		{ state: "present", version: "1.2.3", revision: "b".repeat(40) },
+		{ state: "present", version: "1.2.4", revision: sha },
+		{ state: "unavailable", reason: "registry_read_failed" },
+		undefined,
+	]) {
+		assert.throws(
+			() =>
+				releasePublication("v1.2.3", sha, success, [release("v1.2.3")], {
+					versionTag,
+					latest: { state: "missing" },
+					minor: { state: "missing" },
+				}),
+			/immutable version tag/,
+		);
 	}
 });
 
@@ -207,6 +239,17 @@ async function registryFixture(t, mode) {
 			}
 			if (request.headers.authorization !== "Bearer synthetic-registry-token")
 				return send(401, {});
+		}
+		if (leaf === "1.2.3") {
+			if (mode === "version-matching" || mode === "version-conflict")
+				return send(200, {
+					mediaType: indexType,
+					manifests: ["e", "f"].map((char) => ({
+						mediaType: manifestType,
+						digest: digest(char),
+					})),
+				});
+			return send(404, { errors: [{ code: "MANIFEST_UNKNOWN" }] });
 		}
 		if (mode === "read-timeout") return;
 		if (mode === "connection-reset") return request.socket.destroy();
@@ -249,16 +292,24 @@ async function registryFixture(t, mode) {
 				mediaType: manifestType,
 				config: { digest: digest(leaf === digest("a") ? "c" : "d") },
 			});
-		if (leaf === digest("c") || leaf === digest("d"))
+		if (leaf === digest("e") || leaf === digest("f"))
+			return send(200, {
+				mediaType: manifestType,
+				config: { digest: digest(leaf === digest("e") ? "1" : "2") },
+			});
+		if (leaf === digest("c") || leaf === digest("d") || leaf === digest("1") || leaf === digest("2"))
 			return send(200, {
 				config: {
 					Labels: {
-						"org.opencontainers.image.version":
-							mode === "disagree" && leaf === digest("d")
+						"org.opencontainers.image.version": [digest("1"), digest("2")].includes(leaf)
+							? "1.2.3"
+							: mode === "disagree" && leaf === digest("d")
 								? "1.2.8"
 								: mode === "malformed"
 									? "not-a-version"
 									: "1.2.9",
+						"org.opencontainers.image.revision":
+							mode === "version-conflict" ? "b".repeat(40) : sha,
 					},
 				},
 			});
@@ -280,6 +331,34 @@ async function registryFixture(t, mode) {
 	};
 }
 
+test("registry evidence identifies a matching immutable version", async (t) => {
+	const options = await registryFixture(t, "version-matching");
+	const evidence = await registryEvidence("v1.2.3", options);
+	assert.deepEqual(evidence.versionTag, {
+		state: "present",
+		version: "1.2.3",
+		revision: sha,
+	});
+	const result = releasePublication(
+		"v1.2.3",
+		sha,
+		success,
+		[release("v1.2.3")],
+		evidence,
+	);
+	assert.equal(result.alreadyPublished, true);
+	assert.deepEqual(result.tags, []);
+});
+
+test("registry evidence rejects an immutable version with another revision", async (t) => {
+	const options = await registryFixture(t, "version-conflict");
+	const evidence = await registryEvidence("v1.2.3", options);
+	assert.throws(
+		() => releasePublication("v1.2.3", sha, success, [release("v1.2.3")], evidence),
+		/different release revision/,
+	);
+});
+
 for (const mode of [
 	"consistent",
 	"disagree",
@@ -300,6 +379,7 @@ for (const mode of [
 	test(`real registry HTTP boundary classifies ${mode}`, async (t) => {
 		const options = await registryFixture(t, mode);
 		const evidence = await registryEvidence("v1.2.3", options);
+		assert.deepEqual(evidence.versionTag, { state: "missing" });
 		const result = releasePublication(
 			"v1.2.3",
 			sha,
@@ -425,11 +505,13 @@ for (const mode of [
 		);
 		if (mode === "token-failed" || mode === "token-missing") {
 			assert.deepEqual(evidence, {
+				versionTag: { state: "unavailable", reason: "registry_auth_failed" },
 				latest: { state: "unavailable", reason: "registry_auth_failed" },
 				minor: { state: "unavailable", reason: "registry_auth_failed" },
 			});
 			assert.equal(fixture.calls.length, 2);
 		} else {
+			assert.deepEqual(evidence.versionTag, { state: "missing" });
 			assert.deepEqual(evidence.latest, { state: "present", version: "1.2.9" });
 			assert.deepEqual(evidence.minor, evidence.latest);
 			assert.ok(
@@ -463,7 +545,7 @@ test("release flags must match version stability", () => {
 	}
 });
 
-test("CLI with unreadable or malformed registry evidence publishes only the verified version with a warning", (t) => {
+test("CLI with unreadable or malformed immutable-tag evidence fails closed", (t) => {
 	const root = mkdtempSync(join(tmpdir(), "registry-cli-unavailable-"));
 	t.after(() => rmSync(root, { recursive: true, force: true }));
 	writeFileSync(join(root, "status"), JSON.stringify(success));
@@ -486,11 +568,7 @@ test("CLI with unreadable or malformed registry evidence publishes only the veri
 			],
 			{ encoding: "utf8" },
 		);
-		assert.equal(cli.status, 0);
-		assert.deepEqual(JSON.parse(cli.stdout).tags, ["1.2.3"]);
-		assert.match(
-			cli.stderr,
-			/release alias withheld: latest registry_evidence_unavailable/,
-		);
+		assert.notEqual(cli.status, 0);
+		assert.match(cli.stderr, /immutable version tag registry evidence is unavailable/);
 	}
 });
